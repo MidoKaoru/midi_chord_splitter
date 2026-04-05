@@ -48,7 +48,6 @@
     background: #f0ebff;
     border-color: #5b21b6;
   }
-  .drop-zone input[type=file] { display: none; }
 
   .track-list { display: flex; flex-direction: column; gap: 8px; }
   .track-item {
@@ -190,8 +189,8 @@
   <h3>① MIDIファイルを選択</h3>
   <div class="drop-zone" id="dropZone">
     ここに .mid ファイルをドロップ<br>またはクリックして選択
-    <input type="file" id="fileInput" accept=".mid,.midi">
   </div>
+  <input type="file" id="fileInput" accept=".mid,.midi" style="display:none">
   <div id="status"></div>
 </div>
 
@@ -237,10 +236,204 @@
   このツールは完全にブラウザ内部で動作し、MIDIデータが外部サーバーに送信・保存されることは一切ありません。</p>
 </div>
 
-<script type="module">
-import { parseMidi, writeMidi } from 'https://esm.sh/midi-file@1.1.7';
+<script>
+// ============================================================
+//  MIDI Parser
+// ============================================================
+function parseMidi(input) {
+  const bytes = (input instanceof Uint8Array) ? input : new Uint8Array(input);
+  let p = 0;
 
-let parsedMidi = null, originalBytes = null, selectedTrackIdx = null, resultBytes = null;
+  const r8    = () => bytes[p++];
+  const r16   = () => { const v = (bytes[p] << 8) | bytes[p + 1]; p += 2; return v >>> 0; };
+  const r32   = () => { const v = ((bytes[p] << 24) | (bytes[p+1] << 16) | (bytes[p+2] << 8) | bytes[p+3]) >>> 0; p += 4; return v; };
+  const rStr  = n  => { let s = ''; for (let i = 0; i < n; i++) s += String.fromCharCode(bytes[p++]); return s; };
+  const rVLQ  = () => { let v = 0, b; do { b = bytes[p++]; v = (v << 7) | (b & 0x7F); } while (b & 0x80); return v; };
+  const rBytes = n => { const sl = bytes.slice(p, p + n); p += n; return sl; };
+  const toStr  = arr => Array.from(arr).map(b => String.fromCharCode(b)).join('');
+
+  if (rStr(4) !== 'MThd') throw new Error('MIDIファイルではありません（MThd が見つかりません）');
+  const hLen = r32();
+  const format      = r16();
+  const numTracks   = r16();
+  const ticksPerBeat = r16();
+  p += hLen - 6; // ヘッダ拡張分をスキップ
+
+  const tracks = [];
+
+  for (let t = 0; t < numTracks; t++) {
+    // MTrk 以外のチャンクはスキップ
+    const chunkId = rStr(4);
+    const chunkLen = r32();
+    if (chunkId !== 'MTrk') { p += chunkLen; t--; continue; }
+
+    const tEnd = p + chunkLen;
+    const events = [];
+    let lastStatus = 0;
+
+    while (p < tEnd) {
+      const deltaTime = rVLQ();
+      const peek = bytes[p];
+      let status;
+
+      if (peek & 0x80) {
+        status = peek; p++;
+        // SysEx・Meta はランニングステータスをリセット
+        if (status !== 0xF0 && status !== 0xF7 && status !== 0xFF) lastStatus = status;
+      } else {
+        status = lastStatus; // ランニングステータス
+      }
+
+      if (status === 0xFF) {
+        // ─── メタイベント ───
+        const mType = r8();
+        const mLen  = rVLQ();
+        const mData = rBytes(mLen);
+        const ev = { deltaTime };
+
+        switch (mType) {
+          case 0x00: ev.type = 'sequenceNumber'; ev.number = (mData[0] << 8) | mData[1]; break;
+          case 0x01: ev.type = 'text';            ev.text = toStr(mData); break;
+          case 0x02: ev.type = 'copyrightNotice'; ev.text = toStr(mData); break;
+          case 0x03: ev.type = 'trackName';        ev.text = toStr(mData); break;
+          case 0x04: ev.type = 'instrumentName';   ev.text = toStr(mData); break;
+          case 0x05: ev.type = 'lyrics';            ev.text = toStr(mData); break;
+          case 0x06: ev.type = 'marker';            ev.text = toStr(mData); break;
+          case 0x07: ev.type = 'cuePoint';          ev.text = toStr(mData); break;
+          case 0x20: ev.type = 'channelPrefix'; ev.channel = mData[0]; break;
+          case 0x21: ev.type = 'portPrefix';    ev.port    = mData[0]; break;
+          case 0x2F: ev.type = 'endOfTrack'; break;
+          case 0x51: ev.type = 'setTempo'; ev.microsecondsPerBeat = (mData[0] << 16) | (mData[1] << 8) | mData[2]; break;
+          case 0x54: ev.type = 'smpteOffset';
+            ev.frameRate = mData[0] >> 5; ev.hour = mData[0] & 0x1F;
+            ev.min = mData[1]; ev.sec = mData[2]; ev.frame = mData[3]; ev.subframe = mData[4]; break;
+          case 0x58: ev.type = 'timeSignature';
+            ev.numerator = mData[0]; ev.denominator = 1 << mData[1];
+            ev.metronome = mData[2]; ev.thirtyseconds = mData[3]; break;
+          case 0x59: ev.type = 'keySignature';
+            ev.key = mData[0] > 127 ? mData[0] - 256 : mData[0]; ev.scale = mData[1]; break;
+          case 0x7F: ev.type = 'sequencerSpecific'; ev.data = Array.from(mData); break;
+          default:   ev.type = 'unknownMeta'; ev.metaType = mType; ev.data = Array.from(mData); break;
+        }
+        events.push(ev);
+        lastStatus = 0; // メタ後はランニングステータスをリセット
+
+      } else if (status === 0xF0 || status === 0xF7) {
+        // ─── SysEx ───
+        const sLen  = rVLQ();
+        const sData = rBytes(sLen);
+        events.push({ deltaTime, type: status === 0xF0 ? 'sysEx' : 'sysExContinue', data: Array.from(sData) });
+        lastStatus = 0;
+
+      } else {
+        // ─── チャンネルイベント ───
+        const evType = status >> 4;
+        const ch     = status & 0x0F;
+        const ev     = { deltaTime, channel: ch };
+
+        switch (evType) {
+          case 0x8: ev.type = 'noteOff';          ev.note = r8(); ev.velocity = r8(); break;
+          case 0x9: ev.type = 'noteOn';           ev.note = r8(); ev.velocity = r8(); break;
+          case 0xA: ev.type = 'noteAftertouch';   ev.note = r8(); ev.amount   = r8(); break;
+          case 0xB: ev.type = 'controller';       ev.controllerType = r8(); ev.value = r8(); break;
+          case 0xC: ev.type = 'programChange';    ev.programNumber  = r8(); break;
+          case 0xD: ev.type = 'channelAftertouch'; ev.amount = r8(); break;
+          case 0xE: { const lo = r8(), hi = r8(); ev.type = 'pitchBend'; ev.value = ((hi << 7) | lo) - 0x2000; break; }
+          default:  p++; break; // 不明なステータスは1バイトスキップ
+        }
+        events.push(ev);
+      }
+    }
+
+    p = tEnd; // チャンク境界に確実に移動
+    tracks.push(events);
+  }
+
+  return { header: { format, numTracks: tracks.length, ticksPerBeat }, tracks };
+}
+
+// ============================================================
+//  MIDI Writer
+// ============================================================
+function writeMidi(midi) {
+  const out = [];
+  const w8   = v => out.push(v & 0xFF);
+  const w16  = v => out.push((v >> 8) & 0xFF, v & 0xFF);
+  const w32  = v => out.push((v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF);
+  const wStr = s => { for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i)); };
+  const wVLQ = n => {
+    n = (n >>> 0);
+    const buf = [n & 0x7F]; n >>= 7;
+    while (n > 0) { buf.unshift((n & 0x7F) | 0x80); n >>= 7; }
+    for (const b of buf) out.push(b);
+  };
+
+  // ── ヘッダ ──
+  wStr('MThd'); w32(6);
+  w16(midi.header.format || 1);
+  w16(midi.tracks.length);
+  w16(midi.header.ticksPerBeat || 480);
+
+  // ── トラック ──
+  for (const track of midi.tracks) {
+    const td = [];
+    const tw8   = v => td.push(v & 0xFF);
+    const twVLQ = n => {
+      n = ((n || 0) >>> 0);
+      const buf = [n & 0x7F]; n >>= 7;
+      while (n > 0) { buf.unshift((n & 0x7F) | 0x80); n >>= 7; }
+      for (const b of buf) td.push(b);
+    };
+    const twMeta = (mt, data) => { td.push(0xFF, mt); twVLQ(data.length); for (const b of data) td.push(b & 0xFF); };
+    const twText = (mt, text)  => {
+      const enc = Array.from(text || '').map(c => c.charCodeAt(0) & 0xFF);
+      td.push(0xFF, mt); twVLQ(enc.length); for (const b of enc) td.push(b);
+    };
+
+    let hasEOT = false;
+    for (const ev of track) {
+      twVLQ(ev.deltaTime || 0);
+      switch (ev.type) {
+        case 'noteOff':           tw8(0x80|(ev.channel&0xF)); tw8(ev.note&0x7F); tw8(ev.velocity&0x7F); break;
+        case 'noteOn':            tw8(0x90|(ev.channel&0xF)); tw8(ev.note&0x7F); tw8(ev.velocity&0x7F); break;
+        case 'noteAftertouch':    tw8(0xA0|(ev.channel&0xF)); tw8(ev.note&0x7F); tw8(ev.amount&0x7F); break;
+        case 'controller':        tw8(0xB0|(ev.channel&0xF)); tw8(ev.controllerType&0x7F); tw8(ev.value&0x7F); break;
+        case 'programChange':     tw8(0xC0|(ev.channel&0xF)); tw8(ev.programNumber&0x7F); break;
+        case 'channelAftertouch': tw8(0xD0|(ev.channel&0xF)); tw8(ev.amount&0x7F); break;
+        case 'pitchBend':         { const v=(ev.value+0x2000)&0x3FFF; tw8(0xE0|(ev.channel&0xF)); tw8(v&0x7F); tw8((v>>7)&0x7F); break; }
+        case 'sysEx':             { td.push(0xF0); twVLQ((ev.data||[]).length); for (const b of (ev.data||[])) td.push(b&0xFF); break; }
+        case 'endOfTrack':        td.push(0xFF,0x2F,0x00); hasEOT = true; break;
+        case 'setTempo':          { const m = ev.microsecondsPerBeat||500000; td.push(0xFF,0x51,0x03,(m>>16)&0xFF,(m>>8)&0xFF,m&0xFF); break; }
+        case 'timeSignature':     { const d = Math.round(Math.log2(ev.denominator||4)); twMeta(0x58,[ev.numerator||4,d,ev.metronome||24,ev.thirtyseconds||8]); break; }
+        case 'keySignature':      twMeta(0x59,[(ev.key < 0 ? ev.key+256 : ev.key)||0, ev.scale||0]); break;
+        case 'trackName':         twText(0x03, ev.text); break;
+        case 'text':              twText(0x01, ev.text); break;
+        case 'copyrightNotice':   twText(0x02, ev.text); break;
+        case 'instrumentName':    twText(0x04, ev.text); break;
+        case 'lyrics':            twText(0x05, ev.text); break;
+        case 'marker':            twText(0x06, ev.text); break;
+        case 'cuePoint':          twText(0x07, ev.text); break;
+        case 'channelPrefix':     twMeta(0x20, [ev.channel&0xFF]); break;
+        case 'smpteOffset':       twMeta(0x54, [((ev.frameRate||0)<<5)|(ev.hour||0),ev.min||0,ev.sec||0,ev.frame||0,ev.subframe||0]); break;
+        case 'sequenceNumber':    twMeta(0x00, [(ev.number>>8)&0xFF, ev.number&0xFF]); break;
+        case 'sequencerSpecific': twMeta(0x7F, ev.data||[]); break;
+        case 'unknownMeta':       twMeta(ev.metaType, ev.data||[]); break;
+        default: break;
+      }
+    }
+    if (!hasEOT) td.push(0x00, 0xFF, 0x2F, 0x00);
+
+    wStr('MTrk'); w32(td.length);
+    for (const b of td) out.push(b);
+  }
+
+  return out;
+}
+
+// ============================================================
+//  アプリケーション本体
+// ============================================================
+let parsedMidi = null, selectedTrackIdx = null, resultBytes = null;
 let fileName = 'split_output.mid';
 
 const $ = id => document.getElementById(id);
@@ -249,24 +442,28 @@ function hide(id) { $(id).style.display = 'none'; }
 
 function setStatus(el, msg, type) {
   el.innerHTML = msg;
-  el.className = type === 'success' ? 'status-success' : type === 'error' ? 'status-error' : 'status-info';
+  el.className = type === 'success' ? 'status-success'
+               : type === 'error'   ? 'status-error'
+               : 'status-info';
 }
 
+// ── tick 変換ユーティリティ ──
 function toAbsolute(events) {
   let t = 0;
-  return events.map(e => { t += e.deltaTime; return { ...e, _abs: t }; });
+  return events.map(e => { t += (e.deltaTime || 0); return { ...e, _abs: t }; });
 }
 function toDelta(events) {
   let cur = 0;
   return events.map(e => {
-    const dt = Math.max(0, e._abs - cur);
+    const dt  = Math.max(0, e._abs - cur);
     cur = e._abs;
-    const ev = { ...e, deltaTime: dt };
+    const ev  = { ...e, deltaTime: dt };
     delete ev._abs;
     return ev;
   });
 }
 
+// ── ファイル読み込み ──
 async function loadFile(file) {
   const statusEl = $('status');
   if (!file || !file.name.match(/\.midi?$/i)) {
@@ -274,14 +471,15 @@ async function loadFile(file) {
     return;
   }
   fileName = file.name.replace(/\.midi?$/i, '') + '_split.mid';
+
   const buf = await file.arrayBuffer();
-  originalBytes = new Uint8Array(buf);
   try {
-    parsedMidi = parseMidi(originalBytes);
+    parsedMidi = parseMidi(new Uint8Array(buf));
   } catch(e) {
     setStatus(statusEl, `⚠ MIDIファイルの解析に失敗しました: ${e.message}`, 'error');
     return;
   }
+
   setStatus(statusEl, `✓ ${file.name} を読み込みました（トラック数: ${parsedMidi.tracks.length}）`, 'success');
   renderTrackList();
   show('trackCard'); show('settingsCard'); show('executeCard');
@@ -290,6 +488,7 @@ async function loadFile(file) {
   resultBytes = null;
 }
 
+// ── トラックリスト描画 ──
 function trackNoteCount(track) {
   return track.filter(e => e.type === 'noteOn' && e.velocity > 0).length;
 }
@@ -302,10 +501,11 @@ function renderTrackList() {
   const list = $('trackList');
   list.innerHTML = '';
   selectedTrackIdx = null;
+
   parsedMidi.tracks.forEach((track, idx) => {
     const notes = trackNoteCount(track);
-    const name = trackDisplayName(track, idx);
-    const item = document.createElement('div');
+    const name  = trackDisplayName(track, idx);
+    const item  = document.createElement('div');
     item.className = 'track-item';
     item.innerHTML = `
       <input type="radio" name="track" value="${idx}">
@@ -323,34 +523,46 @@ function renderTrackList() {
   });
 }
 
+// ── 許容誤差 ──
 $('toleranceMode').addEventListener('change', () => {
   $('customToleranceRow').style.display = $('toleranceMode').value === 'custom' ? '' : 'none';
 });
-
 function getTolerance() {
   const v = $('toleranceMode').value;
   return v === 'custom' ? (parseInt($('customTolerance').value) || 0) : parseInt(v);
 }
 
+// ── 和音分割コア ──
 function splitTrack(track, splitCount, tolerance) {
   const absEvents = toAbsolute(track);
-  const noteOns  = absEvents.filter(e => e.type === 'noteOn' && e.velocity > 0);
-  const noteOffs = absEvents.filter(e => e.type === 'noteOff' || (e.type === 'noteOn' && e.velocity === 0));
+  const noteOns   = absEvents.filter(e => e.type === 'noteOn'  && e.velocity > 0);
+  const noteOffs  = absEvents.filter(e => e.type === 'noteOff' || (e.type === 'noteOn' && e.velocity === 0));
 
-  const groups = [];
+  // 同タイミングのノートをグループ化し、音高降順にソート
   const used = new Array(noteOns.length).fill(false);
+  const groups = [];
   noteOns.forEach((on, i) => {
     if (used[i]) return;
-    const group = [on]; used[i] = true;
+    const group = [on];
+    used[i] = true;
     noteOns.forEach((on2, j) => {
-      if (!used[j] && Math.abs(on2._abs - on._abs) <= tolerance) { group.push(on2); used[j] = true; }
+      if (!used[j] && Math.abs(on2._abs - on._abs) <= tolerance) {
+        group.push(on2);
+        used[j] = true;
+      }
     });
-    group.sort((a, b) => b.note - a.note);
+    group.sort((a, b) => b.note - a.note); // 高音→低音
     groups.push(group);
   });
 
+  // 対応する noteOff を検索（チャンネル＋ノート番号が一致する最初の未使用）
   function findNoteOff(on) {
-    return noteOffs.find(off => off.note === on.note && off.channel === on.channel && off._abs >= on._abs && !off._used);
+    return noteOffs.find(off =>
+      off.note === on.note &&
+      off.channel === on.channel &&
+      off._abs >= on._abs &&
+      !off._used
+    );
   }
 
   const splitTracks = Array.from({ length: splitCount }, () => []);
@@ -360,48 +572,76 @@ function splitTrack(track, splitCount, tolerance) {
     group.forEach((on, i) => {
       const tIdx = i < splitCount ? i : splitCount - 1;
       if (i >= splitCount) overflowInfo.count++;
+
       splitTracks[tIdx].push({ ...on });
       const off = findNoteOff(on);
-      if (off) { off._used = true; splitTracks[tIdx].push({ ...off }); }
-      else splitTracks[tIdx].push({ ...on, type: 'noteOff', velocity: 0, _abs: on._abs + 1 });
+      if (off) {
+        off._used = true;
+        splitTracks[tIdx].push({ ...off });
+      } else {
+        // 対応する noteOff がない場合は直後に追加
+        splitTracks[tIdx].push({ ...on, type: 'noteOff', velocity: 0, _abs: on._abs + 1 });
+      }
     });
   });
 
-  const maxAbs = Math.max(...absEvents.map(e => e._abs), 0);
+  // 元トラックの最終 tick（endOfTrack 用）
+  const maxAbs = absEvents.reduce((m, e) => Math.max(m, e._abs), 0);
+
   const result = splitTracks.map(evs => {
     const sorted = evs.sort((a, b) => a._abs - b._abs);
-    sorted.push({ type: 'endOfTrack', deltaTime: 0, _abs: maxAbs });
+    // sorted 内の最終 tick と元トラックの最終 tick のいずれか大きい方に endOfTrack を置く
+    const lastEvAbs = sorted.length ? sorted[sorted.length - 1]._abs : 0;
+    sorted.push({ type: 'endOfTrack', deltaTime: 0, _abs: Math.max(maxAbs, lastEvAbs) });
     return toDelta(sorted);
   });
+
   return { tracks: result, overflowInfo };
 }
 
+// ── 出力 MIDI 構築 ──
 function buildOutput(splitCount, tolerance) {
   if (selectedTrackIdx === null) throw new Error('トラックが選択されていません');
+
   const src = JSON.parse(JSON.stringify(parsedMidi));
   const targetTrack = src.tracks[selectedTrackIdx];
-  const otherTracks = src.tracks.filter((_, i) => i !== selectedTrackIdx);
   const { tracks: newTracks, overflowInfo } = splitTrack(targetTrack, splitCount, tolerance);
 
-  const meta = src.tracks[0] ? toAbsolute(src.tracks[0]) : [];
-  const metaOnly = meta.filter(e =>
-    e.type === 'setTempo' || e.type === 'timeSignature' || e.type === 'keySignature' || e.type === 'trackName'
-  );
-  const metaTrack = [...metaOnly].sort((a, b) => a._abs - b._abs);
-  const maxMetaAbs = metaTrack.length ? metaTrack[metaTrack.length - 1]._abs : 0;
-  metaTrack.push({ type: 'endOfTrack', deltaTime: 0, _abs: maxMetaAbs });
+  const finalTracks = [];
 
-  const finalTracks = [toDelta(metaTrack)];
-  otherTracks.filter((_, i) => {
-    const origIdx = i < selectedTrackIdx ? i : i + 1;
-    return origIdx !== 0;
-  }).forEach(t => finalTracks.push(t));
+  // テンポ・拍子トラックの決定
+  // Format 1 かつ 対象がトラック0以外 → トラック0（専用テンポトラック）をそのまま使う
+  // それ以外（Format 0 や対象がトラック0）→ 対象トラックからメタイベントを抽出して生成
+  if (src.header.format === 1 && selectedTrackIdx !== 0) {
+    finalTracks.push(src.tracks[0]);
+  } else {
+    const absEvs = toAbsolute(targetTrack);
+    const metaEvs = absEvs
+      .filter(e => e.type === 'setTempo' || e.type === 'timeSignature' || e.type === 'keySignature')
+      .sort((a, b) => a._abs - b._abs);
+    const maxA = metaEvs.length ? metaEvs[metaEvs.length - 1]._abs : 0;
+    metaEvs.push({ type: 'endOfTrack', deltaTime: 0, _abs: maxA });
+    finalTracks.push(toDelta(metaEvs));
+  }
+
+  // 対象トラックでもテンポトラックでもないトラックを追加
+  src.tracks.forEach((t, i) => {
+    if (i === selectedTrackIdx) return;              // 分割対象はスキップ
+    if (src.header.format === 1 && i === 0) return; // テンポトラックはスキップ（上で追加済み）
+    finalTracks.push(t);
+  });
+
+  // 分割結果を追加
   newTracks.forEach(t => finalTracks.push(t));
 
-  const output = { header: { ...src.header, format: 1, numTracks: finalTracks.length }, tracks: finalTracks };
+  const output = {
+    header: { ...src.header, format: 1, numTracks: finalTracks.length },
+    tracks: finalTracks
+  };
   return { output, overflowInfo, newTracks };
 }
 
+// ── プレビュー描画 ──
 function renderPreview(newTracks, overflowInfo) {
   const notes = newTracks.map(t => t.filter(e => e.type === 'noteOn' && e.velocity > 0).length);
   let html = '<div class="preview"><div class="preview-title">分割プレビュー</div>';
@@ -418,6 +658,22 @@ function renderPreview(newTracks, overflowInfo) {
   $('previewArea').innerHTML = html;
 }
 
+// ── イベントハンドラ ──
+const dropZone  = $('dropZone');
+const fileInput = $('fileInput');
+
+dropZone.addEventListener('click',     () => fileInput.click());
+dropZone.addEventListener('dragover',  e  => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop',      e  => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
 $('runBtn').addEventListener('click', () => {
   const runStatusEl = $('runStatus');
   $('previewArea').innerHTML = '';
@@ -425,8 +681,9 @@ $('runBtn').addEventListener('click', () => {
   runStatusEl.textContent = '';
   runStatusEl.className = 'run-status';
 
-  if (!parsedMidi) { setStatus(runStatusEl, '⚠ MIDIファイルを読み込んでください', 'error'); return; }
+  if (!parsedMidi)           { setStatus(runStatusEl, '⚠ MIDIファイルを読み込んでください', 'error'); return; }
   if (selectedTrackIdx === null) { setStatus(runStatusEl, '⚠ 分割対象トラックを選択してください', 'error'); return; }
+
   const splitCount = parseInt($('splitCount').value);
   if (!splitCount || splitCount < 2) { setStatus(runStatusEl, '⚠ 分割数は2以上で入力してください', 'error'); return; }
 
@@ -447,18 +704,9 @@ $('downloadBtn').addEventListener('click', () => {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = fileName;
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(a.href);
-});
-
-$('dropZone').addEventListener('click', () => $('fileInput').click());
-$('fileInput').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
-$('dropZone').addEventListener('dragover', e => { e.preventDefault(); $('dropZone').classList.add('dragover'); });
-$('dropZone').addEventListener('dragleave', () => $('dropZone').classList.remove('dragover'));
-$('dropZone').addEventListener('drop', e => {
-  e.preventDefault();
-  $('dropZone').classList.remove('dragover');
-  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 100);
 });
 </script>
 </body>
