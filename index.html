@@ -73,6 +73,7 @@
   .form-group:last-child { margin-bottom: 0; }
   .form-group label { display: block; font-size: 0.85em; color: #555; margin-bottom: 5px; font-weight: bold; }
   .form-group input[type=number],
+  .form-group input[type=text],
   .form-group select {
     width: 100%;
     padding: 8px 10px;
@@ -550,7 +551,7 @@ function validateSplitCount() {
   // 半角数字以外が含まれている場合
   if (!/^\d+$/.test(raw)) {
     errEl.textContent  = '⚠ 半角数字で入力してください';
-    errEl.style.display = '';
+    errEl.style.display = 'block';
     input.classList.add('input-error');
     return false;
   }
@@ -560,7 +561,7 @@ function validateSplitCount() {
   // 10以上はエラー
   if (num >= 10) {
     errEl.textContent  = '⚠ 分割数は9以下で入力してください';
-    errEl.style.display = '';
+    errEl.style.display = 'block';
     input.classList.add('input-error');
     return false;
   }
@@ -568,7 +569,7 @@ function validateSplitCount() {
   // 2未満はエラー
   if (num < 2) {
     errEl.textContent  = '⚠ 分割数は2以上で入力してください';
-    errEl.style.display = '';
+    errEl.style.display = 'block';
     input.classList.add('input-error');
     return false;
   }
