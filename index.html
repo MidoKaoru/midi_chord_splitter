@@ -555,6 +555,9 @@ function splitTrack(track, splitCount, tolerance) {
     groups.push(group);
   });
 
+  // グループを時系列順に並べる（toAbsolute 後の順序に依存しないよう明示ソート）
+  groups.sort((a, b) => a[0]._abs - b[0]._abs);
+
   // 対応する noteOff を検索（チャンネル＋ノート番号が一致する最初の未使用）
   function findNoteOff(on) {
     return noteOffs.find(off =>
@@ -565,23 +568,48 @@ function splitTrack(track, splitCount, tolerance) {
     );
   }
 
-  const splitTracks = Array.from({ length: splitCount }, () => []);
+  const splitTracks  = Array.from({ length: splitCount }, () => []);
   const overflowInfo = { count: 0 };
 
+  // 各トラックの「発音終了 tick」を管理する配列
+  // trackEndTick[i] <= 現在のグループ開始 tick であれば、そのトラックは空き
+  const trackEndTick = new Array(splitCount).fill(0);
+
   groups.forEach(group => {
-    group.forEach((on, i) => {
-      const tIdx = i < splitCount ? i : splitCount - 1;
-      if (i >= splitCount) overflowInfo.count++;
+    const groupTick = group[0]._abs;
+
+    // このタイミングで発音が終わっている（空き）トラックを番号昇順で列挙
+    const freeTracks = [];
+    for (let t = 0; t < splitCount; t++) {
+      if (trackEndTick[t] <= groupTick) freeTracks.push(t);
+    }
+
+    group.forEach((on, noteIdx) => {
+      let tIdx;
+      if (noteIdx < freeTracks.length) {
+        // 空きトラックに番号の小さい順で割り当て
+        tIdx = freeTracks[noteIdx];
+      } else {
+        // 全トラックが発音中で空きなし → 最終トラックに集約
+        overflowInfo.count++;
+        tIdx = splitCount - 1;
+      }
 
       splitTracks[tIdx].push({ ...on });
       const off = findNoteOff(on);
+      let endTick;
       if (off) {
         off._used = true;
         splitTracks[tIdx].push({ ...off });
+        endTick = off._abs;
       } else {
-        // 対応する noteOff がない場合は直後に追加
-        splitTracks[tIdx].push({ ...on, type: 'noteOff', velocity: 0, _abs: on._abs + 1 });
+        // 対応する noteOff がない場合は直後に補完
+        endTick = on._abs + 1;
+        splitTracks[tIdx].push({ ...on, type: 'noteOff', velocity: 0, _abs: endTick });
       }
+
+      // トラックの発音終了 tick を更新（同一トラックに複数音が入る場合は最大値を保持）
+      trackEndTick[tIdx] = Math.max(trackEndTick[tIdx], endTick);
     });
   });
 
