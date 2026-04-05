@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MIDI Chord Splitter</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: sans-serif;
+    text-align: center;
+    background-color: #f4f7f6;
+    padding: 30px 10px;
+    margin: 0;
+  }
+
+  .container {
+    max-width: 600px;
+    margin: 0 auto 20px;
+    background: white;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    box-sizing: border-box;
+    text-align: left;
+  }
+
+  .container-header { text-align: center; margin-bottom: 20px; }
+  .container-header h2 { font-size: 1.5em; color: #333; margin-bottom: 6px; }
+  .container-header p { font-size: 0.9em; color: #666; line-height: 1.5; }
+
+  h3 { font-size: 1em; color: #555; margin-bottom: 12px; }
+
+  .drop-zone {
+    border: 2px dashed #7c3aed;
+    border-radius: 10px;
+    padding: 40px 20px;
+    cursor: pointer;
+    color: #555;
+    transition: background 0.3s;
+    background-color: #faf8ff;
+    text-align: center;
+    font-size: 0.9em;
+    margin-bottom: 10px;
+  }
+  .drop-zone:hover, .drop-zone.dragover {
+    background: #f0ebff;
+    border-color: #5b21b6;
+  }
+  .drop-zone input[type=file] { display: none; }
+
+  .track-list { display: flex; flex-direction: column; gap: 8px; }
+  .track-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: #faf8ff;
+    border-radius: 8px;
+    border: 1px solid #ddd;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    font-size: 0.9em;
+  }
+  .track-item:hover { border-color: #7c3aed; background: #f3eeff; }
+  .track-item.selected { border-color: #7c3aed; background: #ede9fe; }
+  .track-item input[type=radio] { accent-color: #7c3aed; flex-shrink: 0; }
+  .track-info { flex: 1; }
+  .track-name { font-weight: bold; color: #333; }
+  .track-meta { font-size: 0.8em; color: #888; margin-top: 2px; }
+
+  .form-group { margin-bottom: 14px; }
+  .form-group:last-child { margin-bottom: 0; }
+  .form-group label { display: block; font-size: 0.85em; color: #555; margin-bottom: 5px; font-weight: bold; }
+  .form-group input[type=number],
+  .form-group select {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 0.9em;
+    color: #333;
+    background: white;
+  }
+  .form-group input[type=number]:focus,
+  .form-group select:focus {
+    outline: none;
+    border-color: #7c3aed;
+    box-shadow: 0 0 0 2px rgba(124,58,237,0.15);
+  }
+
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 12px;
+    border: none;
+    border-radius: 8px;
+    font-size: 1em;
+    font-weight: bold;
+    cursor: pointer;
+    transition: background 0.2s, opacity 0.2s;
+    text-align: center;
+  }
+  .btn-primary { background-color: #7c3aed; color: white; }
+  .btn-primary:hover:not(:disabled) { background-color: #6d28d9; }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-download { background-color: #28a745; color: white; margin-top: 12px; }
+  .btn-download:hover { background-color: #1e7e34; }
+
+  #status {
+    margin-top: 10px;
+    font-weight: bold;
+    font-size: 0.95em;
+    padding: 8px 12px;
+    border-radius: 5px;
+    min-height: 1.2em;
+    text-align: center;
+  }
+  .status-success { color: green; background-color: #f2fff2; }
+  .status-error   { color: red;   background-color: #fff2f2; }
+  .status-info    { color: #007bff; }
+
+  .run-status {
+    margin-top: 10px;
+    font-size: 0.9em;
+    font-weight: bold;
+    text-align: center;
+    padding: 6px;
+    border-radius: 5px;
+    min-height: 1.2em;
+  }
+
+  .preview {
+    margin-top: 14px;
+    background: #faf8ff;
+    border: 1px solid #e0d7f8;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.85em;
+  }
+  .preview-title { font-weight: bold; color: #7c3aed; margin-bottom: 8px; }
+  .preview-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid #ede9fe;
+    color: #444;
+  }
+  .preview-row:last-of-type { border-bottom: none; }
+  .note-count { font-weight: bold; color: #28a745; }
+  .note-count.zero { color: #999; }
+  .overflow-warn {
+    margin-top: 8px;
+    font-size: 0.82em;
+    color: #b45309;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-radius: 5px;
+    padding: 5px 8px;
+  }
+
+  .footer {
+    max-width: 600px;
+    margin: 10px auto 0;
+    font-size: 0.8em;
+    color: #888;
+    border-top: 1px solid #eee;
+    padding-top: 15px;
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  @media (max-width: 480px) {
+    body { padding: 10px; }
+    .container { padding: 15px; }
+    .drop-zone { padding: 30px 10px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Step 1 -->
+<div class="container">
+  <div class="container-header">
+    <h2>🎵 MIDI Chord Splitter</h2>
+    <p>1つのトラックに入力された和音を、複数のトラックに分割します。<br>※ファイルはサーバーに送信されず、お使いの端末内でのみ安全に処理されます。</p>
+  </div>
+
+  <h3>① MIDIファイルを選択</h3>
+  <div class="drop-zone" id="dropZone">
+    ここに .mid ファイルをドロップ<br>またはクリックして選択
+    <input type="file" id="fileInput" accept=".mid,.midi">
+  </div>
+  <div id="status"></div>
+</div>
+
+<!-- Step 2 -->
+<div class="container" id="trackCard" style="display:none">
+  <h3>② 分割対象トラックを選択</h3>
+  <div class="track-list" id="trackList"></div>
+</div>
+
+<!-- Step 3 -->
+<div class="container" id="settingsCard" style="display:none">
+  <h3>③ 分割設定</h3>
+  <div class="form-group">
+    <label>分割するトラック数</label>
+    <input type="number" id="splitCount" value="4" min="2" max="16">
+  </div>
+  <div class="form-group">
+    <label>タイミング許容誤差</label>
+    <select id="toleranceMode">
+      <option value="0">完全一致（0 tick）</option>
+      <option value="10" selected>± 10 tick</option>
+      <option value="custom">カスタム</option>
+    </select>
+  </div>
+  <div class="form-group" id="customToleranceRow" style="display:none">
+    <label>カスタム許容誤差（tick）</label>
+    <input type="number" id="customTolerance" value="10" min="0" max="480">
+  </div>
+</div>
+
+<!-- Step 4 -->
+<div class="container" id="executeCard" style="display:none">
+  <h3>④ 実行 &amp; ダウンロード</h3>
+  <button class="btn btn-primary" id="runBtn">分割を実行</button>
+  <div class="run-status" id="runStatus"></div>
+  <div id="previewArea"></div>
+  <button class="btn btn-download" id="downloadBtn" style="display:none">⬇ .mid をダウンロード</button>
+</div>
+
+<!-- Footer -->
+<div class="footer">
+  <p>🔒 <b>プライバシーについて</b><br>
+  このツールは完全にブラウザ内部で動作し、MIDIデータが外部サーバーに送信・保存されることは一切ありません。</p>
+</div>
+
+<script type="module">
+import { parseMidi, writeMidi } from 'https://esm.sh/midi-file@1.1.7';
+
+let parsedMidi = null, originalBytes = null, selectedTrackIdx = null, resultBytes = null;
+let fileName = 'split_output.mid';
+
+const $ = id => document.getElementById(id);
+function show(id) { $(id).style.display = ''; }
+function hide(id) { $(id).style.display = 'none'; }
+
+function setStatus(el, msg, type) {
+  el.innerHTML = msg;
+  el.className = type === 'success' ? 'status-success' : type === 'error' ? 'status-error' : 'status-info';
+}
+
+function toAbsolute(events) {
+  let t = 0;
+  return events.map(e => { t += e.deltaTime; return { ...e, _abs: t }; });
+}
+function toDelta(events) {
+  let cur = 0;
+  return events.map(e => {
+    const dt = Math.max(0, e._abs - cur);
+    cur = e._abs;
+    const ev = { ...e, deltaTime: dt };
+    delete ev._abs;
+    return ev;
+  });
+}
+
+async function loadFile(file) {
+  const statusEl = $('status');
+  if (!file || !file.name.match(/\.midi?$/i)) {
+    setStatus(statusEl, '⚠ .mid / .midi ファイルを選択してください', 'error');
+    return;
+  }
+  fileName = file.name.replace(/\.midi?$/i, '') + '_split.mid';
+  const buf = await file.arrayBuffer();
+  originalBytes = new Uint8Array(buf);
+  try {
+    parsedMidi = parseMidi(originalBytes);
+  } catch(e) {
+    setStatus(statusEl, `⚠ MIDIファイルの解析に失敗しました: ${e.message}`, 'error');
+    return;
+  }
+  setStatus(statusEl, `✓ ${file.name} を読み込みました（トラック数: ${parsedMidi.tracks.length}）`, 'success');
+  renderTrackList();
+  show('trackCard'); show('settingsCard'); show('executeCard');
+  hide('previewArea'); hide('downloadBtn');
+  $('runStatus').textContent = '';
+  resultBytes = null;
+}
+
+function trackNoteCount(track) {
+  return track.filter(e => e.type === 'noteOn' && e.velocity > 0).length;
+}
+function trackDisplayName(track, idx) {
+  const ev = track.find(e => e.type === 'trackName');
+  return ev ? ev.text : `Track ${idx + 1}`;
+}
+
+function renderTrackList() {
+  const list = $('trackList');
+  list.innerHTML = '';
+  selectedTrackIdx = null;
+  parsedMidi.tracks.forEach((track, idx) => {
+    const notes = trackNoteCount(track);
+    const name = trackDisplayName(track, idx);
+    const item = document.createElement('div');
+    item.className = 'track-item';
+    item.innerHTML = `
+      <input type="radio" name="track" value="${idx}">
+      <div class="track-info">
+        <div class="track-name">${name}</div>
+        <div class="track-meta">${notes} ノート</div>
+      </div>`;
+    item.addEventListener('click', () => {
+      document.querySelectorAll('.track-item').forEach(el => el.classList.remove('selected'));
+      item.classList.add('selected');
+      item.querySelector('input').checked = true;
+      selectedTrackIdx = idx;
+    });
+    list.appendChild(item);
+  });
+}
+
+$('toleranceMode').addEventListener('change', () => {
+  $('customToleranceRow').style.display = $('toleranceMode').value === 'custom' ? '' : 'none';
+});
+
+function getTolerance() {
+  const v = $('toleranceMode').value;
+  return v === 'custom' ? (parseInt($('customTolerance').value) || 0) : parseInt(v);
+}
+
+function splitTrack(track, splitCount, tolerance) {
+  const absEvents = toAbsolute(track);
+  const noteOns  = absEvents.filter(e => e.type === 'noteOn' && e.velocity > 0);
+  const noteOffs = absEvents.filter(e => e.type === 'noteOff' || (e.type === 'noteOn' && e.velocity === 0));
+
+  const groups = [];
+  const used = new Array(noteOns.length).fill(false);
+  noteOns.forEach((on, i) => {
+    if (used[i]) return;
+    const group = [on]; used[i] = true;
+    noteOns.forEach((on2, j) => {
+      if (!used[j] && Math.abs(on2._abs - on._abs) <= tolerance) { group.push(on2); used[j] = true; }
+    });
+    group.sort((a, b) => b.note - a.note);
+    groups.push(group);
+  });
+
+  function findNoteOff(on) {
+    return noteOffs.find(off => off.note === on.note && off.channel === on.channel && off._abs >= on._abs && !off._used);
+  }
+
+  const splitTracks = Array.from({ length: splitCount }, () => []);
+  const overflowInfo = { count: 0 };
+
+  groups.forEach(group => {
+    group.forEach((on, i) => {
+      const tIdx = i < splitCount ? i : splitCount - 1;
+      if (i >= splitCount) overflowInfo.count++;
+      splitTracks[tIdx].push({ ...on });
+      const off = findNoteOff(on);
+      if (off) { off._used = true; splitTracks[tIdx].push({ ...off }); }
+      else splitTracks[tIdx].push({ ...on, type: 'noteOff', velocity: 0, _abs: on._abs + 1 });
+    });
+  });
+
+  const maxAbs = Math.max(...absEvents.map(e => e._abs), 0);
+  const result = splitTracks.map(evs => {
+    const sorted = evs.sort((a, b) => a._abs - b._abs);
+    sorted.push({ type: 'endOfTrack', deltaTime: 0, _abs: maxAbs });
+    return toDelta(sorted);
+  });
+  return { tracks: result, overflowInfo };
+}
+
+function buildOutput(splitCount, tolerance) {
+  if (selectedTrackIdx === null) throw new Error('トラックが選択されていません');
+  const src = JSON.parse(JSON.stringify(parsedMidi));
+  const targetTrack = src.tracks[selectedTrackIdx];
+  const otherTracks = src.tracks.filter((_, i) => i !== selectedTrackIdx);
+  const { tracks: newTracks, overflowInfo } = splitTrack(targetTrack, splitCount, tolerance);
+
+  const meta = src.tracks[0] ? toAbsolute(src.tracks[0]) : [];
+  const metaOnly = meta.filter(e =>
+    e.type === 'setTempo' || e.type === 'timeSignature' || e.type === 'keySignature' || e.type === 'trackName'
+  );
+  const metaTrack = [...metaOnly].sort((a, b) => a._abs - b._abs);
+  const maxMetaAbs = metaTrack.length ? metaTrack[metaTrack.length - 1]._abs : 0;
+  metaTrack.push({ type: 'endOfTrack', deltaTime: 0, _abs: maxMetaAbs });
+
+  const finalTracks = [toDelta(metaTrack)];
+  otherTracks.filter((_, i) => {
+    const origIdx = i < selectedTrackIdx ? i : i + 1;
+    return origIdx !== 0;
+  }).forEach(t => finalTracks.push(t));
+  newTracks.forEach(t => finalTracks.push(t));
+
+  const output = { header: { ...src.header, format: 1, numTracks: finalTracks.length }, tracks: finalTracks };
+  return { output, overflowInfo, newTracks };
+}
+
+function renderPreview(newTracks, overflowInfo) {
+  const notes = newTracks.map(t => t.filter(e => e.type === 'noteOn' && e.velocity > 0).length);
+  let html = '<div class="preview"><div class="preview-title">分割プレビュー</div>';
+  notes.forEach((n, i) => {
+    html += `<div class="preview-row">
+      <span>分割トラック ${i + 1}</span>
+      <span class="note-count ${n === 0 ? 'zero' : ''}">${n} ノート${n === 0 ? '（空）' : ''}</span>
+    </div>`;
+  });
+  if (overflowInfo.count > 0) {
+    html += `<div class="overflow-warn">⚠ ${overflowInfo.count} 個の音が最終トラックに集約されました（和音の音数がトラック数を超過）</div>`;
+  }
+  html += '</div>';
+  $('previewArea').innerHTML = html;
+}
+
+$('runBtn').addEventListener('click', () => {
+  const runStatusEl = $('runStatus');
+  $('previewArea').innerHTML = '';
+  hide('downloadBtn');
+  runStatusEl.textContent = '';
+  runStatusEl.className = 'run-status';
+
+  if (!parsedMidi) { setStatus(runStatusEl, '⚠ MIDIファイルを読み込んでください', 'error'); return; }
+  if (selectedTrackIdx === null) { setStatus(runStatusEl, '⚠ 分割対象トラックを選択してください', 'error'); return; }
+  const splitCount = parseInt($('splitCount').value);
+  if (!splitCount || splitCount < 2) { setStatus(runStatusEl, '⚠ 分割数は2以上で入力してください', 'error'); return; }
+
+  try {
+    const { output, overflowInfo, newTracks } = buildOutput(splitCount, getTolerance());
+    resultBytes = new Uint8Array(writeMidi(output));
+    renderPreview(newTracks, overflowInfo);
+    setStatus(runStatusEl, `✓ 分割完了（${splitCount} トラック）`, 'success');
+    show('downloadBtn');
+  } catch(e) {
+    setStatus(runStatusEl, `⚠ エラー: ${e.message}`, 'error');
+  }
+});
+
+$('downloadBtn').addEventListener('click', () => {
+  if (!resultBytes) return;
+  const blob = new Blob([resultBytes], { type: 'audio/midi' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+$('dropZone').addEventListener('click', () => $('fileInput').click());
+$('fileInput').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+$('dropZone').addEventListener('dragover', e => { e.preventDefault(); $('dropZone').classList.add('dragover'); });
+$('dropZone').addEventListener('dragleave', () => $('dropZone').classList.remove('dragover'));
+$('dropZone').addEventListener('drop', e => {
+  e.preventDefault();
+  $('dropZone').classList.remove('dragover');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>
