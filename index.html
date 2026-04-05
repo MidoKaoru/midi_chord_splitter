@@ -83,10 +83,23 @@
     background: white;
   }
   .form-group input[type=number]:focus,
+  .form-group input[type=text]:focus,
   .form-group select:focus {
     outline: none;
     border-color: #7c3aed;
     box-shadow: 0 0 0 2px rgba(124,58,237,0.15);
+  }
+
+  .form-group input.input-error {
+    border-color: #dc3545;
+    box-shadow: 0 0 0 2px rgba(220,53,69,0.15);
+  }
+  .field-error {
+    display: none;
+    margin-top: 5px;
+    font-size: 0.82em;
+    color: #dc3545;
+    font-weight: bold;
   }
 
   .btn {
@@ -205,7 +218,8 @@
   <h3>③ 分割設定</h3>
   <div class="form-group">
     <label>分割するトラック数</label>
-    <input type="number" id="splitCount" value="4" min="2" max="16">
+    <input type="text" id="splitCount" value="3" inputmode="numeric" maxlength="1" autocomplete="off">
+    <div class="field-error" id="splitCountError"></div>
   </div>
   <div class="form-group">
     <label>タイミング許容誤差</label>
@@ -470,6 +484,10 @@ async function loadFile(file) {
     setStatus(statusEl, '⚠ .mid / .midi ファイルを選択してください', 'error');
     return;
   }
+
+  // 新しいファイルを読み込む前に UI・状態を完全リセット
+  resetUI();
+
   fileName = file.name.replace(/\.midi?$/i, '') + '_split.mid';
 
   const buf = await file.arrayBuffer();
@@ -523,6 +541,57 @@ function renderTrackList() {
   });
 }
 
+// ── 分割数バリデーション ──
+function validateSplitCount() {
+  const input  = $('splitCount');
+  const errEl  = $('splitCountError');
+  const raw    = input.value;
+
+  // 半角数字以外が含まれている場合
+  if (!/^\d+$/.test(raw)) {
+    errEl.textContent  = '⚠ 半角数字で入力してください';
+    errEl.style.display = '';
+    input.classList.add('input-error');
+    return false;
+  }
+
+  const num = parseInt(raw, 10);
+
+  // 10以上はエラー
+  if (num >= 10) {
+    errEl.textContent  = '⚠ 分割数は9以下で入力してください';
+    errEl.style.display = '';
+    input.classList.add('input-error');
+    return false;
+  }
+
+  // 2未満はエラー
+  if (num < 2) {
+    errEl.textContent  = '⚠ 分割数は2以上で入力してください';
+    errEl.style.display = '';
+    input.classList.add('input-error');
+    return false;
+  }
+
+  // 問題なし
+  errEl.textContent  = '';
+  errEl.style.display = 'none';
+  input.classList.remove('input-error');
+  return true;
+}
+
+// 入力のたびにリアルタイムでバリデーション
+$('splitCount').addEventListener('input', () => {
+  // type="text" では半角英数以外も入力できるため、入力値が空の場合はエラー表示をクリア
+  if ($('splitCount').value === '') {
+    $('splitCountError').textContent  = '';
+    $('splitCountError').style.display = 'none';
+    $('splitCount').classList.remove('input-error');
+    return;
+  }
+  validateSplitCount();
+});
+
 // ── 許容誤差 ──
 $('toleranceMode').addEventListener('change', () => {
   $('customToleranceRow').style.display = $('toleranceMode').value === 'custom' ? '' : 'none';
@@ -532,74 +601,116 @@ function getTolerance() {
   return v === 'custom' ? (parseInt($('customTolerance').value) || 0) : parseInt(v);
 }
 
+// ── UI・状態リセット ──
+function resetUI() {
+  // 状態変数
+  parsedMidi       = null;
+  selectedTrackIdx = null;
+  resultBytes      = null;
+  fileName         = 'split_output.mid';
+
+  // ステップカードを即時非表示
+  hide('trackCard'); hide('settingsCard'); hide('executeCard');
+
+  // 動的コンテンツをクリア
+  $('trackList').innerHTML  = '';
+  $('previewArea').innerHTML = '';
+
+  // ステータス表示をリセット
+  const statusEl = $('status');
+  statusEl.textContent = '';
+  statusEl.className   = '';
+  const runStatusEl = $('runStatus');
+  runStatusEl.textContent = '';
+  runStatusEl.className   = 'run-status';
+
+  // ダウンロードボタン非表示
+  hide('downloadBtn');
+
+  // ファイル入力リセット（同一ファイルの再選択を可能にする）
+  $('fileInput').value = '';
+}
+
 // ── 和音分割コア ──
 function splitTrack(track, splitCount, tolerance) {
   const absEvents = toAbsolute(track);
-  const noteOns   = absEvents.filter(e => e.type === 'noteOn'  && e.velocity > 0);
-  const noteOffs  = absEvents.filter(e => e.type === 'noteOff' || (e.type === 'noteOn' && e.velocity === 0));
 
-  // 同タイミングのノートをグループ化し、音高降順にソート
-  const used = new Array(noteOns.length).fill(false);
-  const groups = [];
-  noteOns.forEach((on, i) => {
-    if (used[i]) return;
-    const group = [on];
-    used[i] = true;
-    noteOns.forEach((on2, j) => {
-      if (!used[j] && Math.abs(on2._abs - on._abs) <= tolerance) {
-        group.push(on2);
-        used[j] = true;
+  // ── ① noteOn↔noteOff を LIFO スタックで正しくペアリング ──
+  //
+  // 同一ピッチ・チャンネルの音が重複して鳴っている場合、
+  // 「後から鳴り始めた音が先に終わる」という MIDI の標準的な挙動（LIFO）に従う。
+  //
+  // 例: noteOn@0(長) → noteOn@240(短) → noteOff@360 → noteOff@480
+  //   LIFO: noteOn@240 ↔ noteOff@360 / noteOn@0 ↔ noteOff@480  ✓
+  //   単純先頭探索（旧）: noteOn@0 ↔ noteOff@360(誤) / noteOn@240 ↔ noteOff@480(誤)  ✗
+  //
+  const stacks = {}; // key: `${channel}_${note}` → noteOn イベントのスタック
+  const pairs  = []; // { on: noteOn イベント, off: noteOff イベント | null }
+
+  absEvents.forEach(e => {
+    const key = `${e.channel}_${e.note}`;
+    if (e.type === 'noteOn' && e.velocity > 0) {
+      if (!stacks[key]) stacks[key] = [];
+      stacks[key].push(e); // スタックに積む
+    } else if (e.type === 'noteOff' || (e.type === 'noteOn' && e.velocity === 0)) {
+      if (stacks[key] && stacks[key].length > 0) {
+        const on = stacks[key].pop(); // 直近の noteOn をポップ（LIFO）
+        pairs.push({ on, off: e });
+      }
+      // 対応する noteOn がない孤立した noteOff は無視
+    }
+  });
+  // 対応する noteOff がなかった noteOn を末尾に追加（後で補完）
+  Object.values(stacks).forEach(stack => {
+    stack.forEach(on => pairs.push({ on, off: null }));
+  });
+
+  // ── ② ペアを開始 tick 昇順にソートしてグループ化（音高降順） ──
+  pairs.sort((a, b) => a.on._abs - b.on._abs);
+
+  const usedPairs = new Array(pairs.length).fill(false);
+  const groups    = [];
+  pairs.forEach((pair, i) => {
+    if (usedPairs[i]) return;
+    const group = [pair];
+    usedPairs[i] = true;
+    pairs.forEach((pair2, j) => {
+      if (!usedPairs[j] && Math.abs(pair2.on._abs - pair.on._abs) <= tolerance) {
+        group.push(pair2);
+        usedPairs[j] = true;
       }
     });
-    group.sort((a, b) => b.note - a.note); // 高音→低音
+    group.sort((a, b) => b.on.note - a.on.note); // 高音→低音
     groups.push(group);
   });
 
-  // グループを時系列順に並べる（toAbsolute 後の順序に依存しないよう明示ソート）
-  groups.sort((a, b) => a[0]._abs - b[0]._abs);
-
-  // 対応する noteOff を検索（チャンネル＋ノート番号が一致する最初の未使用）
-  function findNoteOff(on) {
-    return noteOffs.find(off =>
-      off.note === on.note &&
-      off.channel === on.channel &&
-      off._abs >= on._abs &&
-      !off._used
-    );
-  }
-
+  // ── ③ グループをトラックに割り当て（発音中のトラックはスキップ） ──
   const splitTracks  = Array.from({ length: splitCount }, () => []);
+  const trackEndTick = new Array(splitCount).fill(0);
   const overflowInfo = { count: 0 };
 
-  // 各トラックの「発音終了 tick」を管理する配列
-  // trackEndTick[i] <= 現在のグループ開始 tick であれば、そのトラックは空き
-  const trackEndTick = new Array(splitCount).fill(0);
-
   groups.forEach(group => {
-    const groupTick = group[0]._abs;
+    const groupTick = group[0].on._abs;
 
-    // このタイミングで発音が終わっている（空き）トラックを番号昇順で列挙
+    // このタイミングで空きのあるトラックを番号昇順で列挙
     const freeTracks = [];
     for (let t = 0; t < splitCount; t++) {
       if (trackEndTick[t] <= groupTick) freeTracks.push(t);
     }
 
-    group.forEach((on, noteIdx) => {
+    group.forEach((pair, noteIdx) => {
+      const { on, off } = pair;
       let tIdx;
       if (noteIdx < freeTracks.length) {
-        // 空きトラックに番号の小さい順で割り当て
-        tIdx = freeTracks[noteIdx];
+        tIdx = freeTracks[noteIdx]; // 空きトラックに番号の小さい順で割り当て
       } else {
-        // 全トラックが発音中で空きなし → 最終トラックに集約
-        overflowInfo.count++;
+        overflowInfo.count++;       // 全トラックが発音中 → 最終トラックに集約
         tIdx = splitCount - 1;
       }
 
       splitTracks[tIdx].push({ ...on });
-      const off = findNoteOff(on);
       let endTick;
       if (off) {
-        off._used = true;
         splitTracks[tIdx].push({ ...off });
         endTick = off._abs;
       } else {
@@ -608,17 +719,15 @@ function splitTrack(track, splitCount, tolerance) {
         splitTracks[tIdx].push({ ...on, type: 'noteOff', velocity: 0, _abs: endTick });
       }
 
-      // トラックの発音終了 tick を更新（同一トラックに複数音が入る場合は最大値を保持）
+      // トラックの発音終了 tick を更新
       trackEndTick[tIdx] = Math.max(trackEndTick[tIdx], endTick);
     });
   });
 
-  // 元トラックの最終 tick（endOfTrack 用）
+  // ── ④ デルタ time 形式に変換して返す ──
   const maxAbs = absEvents.reduce((m, e) => Math.max(m, e._abs), 0);
-
   const result = splitTracks.map(evs => {
-    const sorted = evs.sort((a, b) => a._abs - b._abs);
-    // sorted 内の最終 tick と元トラックの最終 tick のいずれか大きい方に endOfTrack を置く
+    const sorted    = evs.sort((a, b) => a._abs - b._abs);
     const lastEvAbs = sorted.length ? sorted[sorted.length - 1]._abs : 0;
     sorted.push({ type: 'endOfTrack', deltaTime: 0, _abs: Math.max(maxAbs, lastEvAbs) });
     return toDelta(sorted);
@@ -709,11 +818,15 @@ $('runBtn').addEventListener('click', () => {
   runStatusEl.textContent = '';
   runStatusEl.className = 'run-status';
 
-  if (!parsedMidi)           { setStatus(runStatusEl, '⚠ MIDIファイルを読み込んでください', 'error'); return; }
+  if (!parsedMidi)               { setStatus(runStatusEl, '⚠ MIDIファイルを読み込んでください', 'error'); return; }
   if (selectedTrackIdx === null) { setStatus(runStatusEl, '⚠ 分割対象トラックを選択してください', 'error'); return; }
 
-  const splitCount = parseInt($('splitCount').value);
-  if (!splitCount || splitCount < 2) { setStatus(runStatusEl, '⚠ 分割数は2以上で入力してください', 'error'); return; }
+  // 分割数バリデーション（エラーがあれば runStatus にも表示して中断）
+  if (!validateSplitCount()) {
+    setStatus(runStatusEl, '⚠ 分割数の入力値を確認してください', 'error');
+    return;
+  }
+  const splitCount = parseInt($('splitCount').value, 10);
 
   try {
     const { output, overflowInfo, newTracks } = buildOutput(splitCount, getTolerance());
@@ -728,6 +841,8 @@ $('runBtn').addEventListener('click', () => {
 
 $('downloadBtn').addEventListener('click', () => {
   if (!resultBytes) return;
+
+  // ダウンロード開始
   const blob = new Blob([resultBytes], { type: 'audio/midi' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -735,6 +850,23 @@ $('downloadBtn').addEventListener('click', () => {
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 100);
+
+  // ステップカードをフェードアウト
+  ['trackCard', 'settingsCard', 'executeCard'].forEach(id => {
+    $(id).style.transition = 'opacity 0.4s';
+    $(id).style.opacity    = '0';
+  });
+
+  // フェード完了後にリセットし完了メッセージを表示
+  setTimeout(() => {
+    // transition 属性を残したまま resetUI するとちらつくため先に除去
+    ['trackCard', 'settingsCard', 'executeCard'].forEach(id => {
+      $(id).style.transition = '';
+      $(id).style.opacity    = '';
+    });
+    resetUI();
+    setStatus($('status'), '✓ ダウンロードが完了しました。次のファイルをアップロードしてください。', 'success');
+  }, 400);
 });
 </script>
 </body>
